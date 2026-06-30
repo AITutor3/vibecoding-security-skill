@@ -1,0 +1,4 @@
+interface:
+  display_name: "Vibecoding Security"
+  short_description: "Review and fix Next.js, Vercel, and Supabase security issues."
+  default_prompt: "Use $vibecoding-security-skill to review this Next.js/Vercel/Supabase app for security issues and propose fixes."
