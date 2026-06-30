@@ -8,15 +8,17 @@ Use for Supabase Auth, SSR clients, Postgres migrations, RLS policies, Storage, 
 - Grant only the roles and operations needed. Treat grants and RLS as separate controls.
 - Never expose `service_role`, secret keys, database URLs, or admin JWTs to browser code or `NEXT_PUBLIC_*`.
 - Do not use `raw_user_meta_data` or `user_metadata` for authorization. Use `app_metadata`, database tables, or RLS-backed membership tables.
+- In server code, use `supabase.auth.getUser()` as the user authority. Do not use `getSession()` as proof of authentication in Server Components, Server Actions, Route Handlers, or DAL code.
 - Remember JWT claims are not always fresh. Sensitive authorization changes may require token refresh, session revocation, or database-side checks.
 - Treat views, functions, triggers, and storage policies as first-class attack surfaces.
+- Keep application profile data in app-owned tables such as `public.profiles`; do not expose or join directly against `auth.users` from browser-reachable roles.
 
 ## Audit Patterns
 
 Search:
 
 ```bash
-rg -n "service_role|service-role|SUPABASE_SERVICE|createClient|createServerClient|auth\.uid|auth\.jwt|raw_user_meta_data|user_metadata|app_metadata|enable row level security|disable row level security|create policy|alter policy|grant .* to anon|grant .* to authenticated|security definer|security_invoker|storage\.objects|bucket" .
+rg -n "service_role|service-role|SUPABASE_SERVICE|createClient|createServerClient|getSession|getUser|exchangeCodeForSession|auth/callback|redirectTo|auth\.uid|auth\.jwt|raw_user_meta_data|user_metadata|app_metadata|auth\.users|enable row level security|disable row level security|create policy|alter policy|grant .* to anon|grant .* to authenticated|security definer|security_invoker|storage\.objects|bucket|postgres_changes|broadcast|presence|realtime|webhook|x-supabase-signature" .
 ```
 
 Inspect migrations and SQL for:
@@ -30,6 +32,76 @@ Inspect migrations and SQL for:
 - Views without `security_invoker = true` on Postgres 15+.
 - `security definer` functions in `public` or functions with default `EXECUTE` grants.
 - Storage buckets or object policies that allow cross-user path access.
+- Direct `auth.users` reads in app queries, views, or policies exposed to `anon` or `authenticated`.
+
+## Auth Helpers In Next.js
+
+Server-side code must not trust a locally read session as the final identity check.
+
+Unsafe:
+
+```ts
+const {
+  data: { session },
+} = await supabase.auth.getSession()
+
+if (!session) throw new Error('Unauthorized')
+```
+
+Safer:
+
+```ts
+const {
+  data: { user },
+  error,
+} = await supabase.auth.getUser()
+
+if (error || !user) throw new Error('Unauthorized')
+```
+
+Use `getUser()` in Server Components, Server Actions, Route Handlers, DAL modules, webhook-created user flows, and any service-role-adjacent path. `getUser()` validates the token with Supabase Auth before returning the user.
+
+Use `getSession()` only for client-side UI convenience or non-authoritative session display, such as showing a logged-in shell before a server-verified request runs. Never use it to decide database access, ownership, role, billing, invites, admin state, or file access on the server.
+
+## OAuth Callback And Redirect Safety
+
+Audit every `app/auth/callback/route.ts`, `app/api/auth/callback/route.ts`, or equivalent route.
+
+Required:
+
+- Exchange the PKCE code with `exchangeCodeForSession(code)` before treating the request as logged in.
+- Validate `next`, `returnTo`, `redirect`, and `redirectTo` before redirecting.
+- Prefer same-origin relative paths. Reject protocol-relative URLs such as `//evil.example`.
+- Keep Supabase Auth redirect URLs narrow and environment-specific in the dashboard.
+- If using state, bind it to the original auth request and reject mismatches before redirecting.
+
+Safe redirect helper:
+
+```ts
+function safeRelativePath(value: string | null) {
+  if (!value) return '/'
+  if (!value.startsWith('/') || value.startsWith('//')) return '/'
+  return value
+}
+```
+
+Callback sketch:
+
+```ts
+export async function GET(request: Request) {
+  const url = new URL(request.url)
+  const code = url.searchParams.get('code')
+  const next = safeRelativePath(url.searchParams.get('next'))
+
+  if (!code) return NextResponse.redirect(new URL('/login', url.origin))
+
+  const supabase = await createServerSupabase()
+  const { error } = await supabase.auth.exchangeCodeForSession(code)
+  if (error) return NextResponse.redirect(new URL('/login', url.origin))
+
+  return NextResponse.redirect(new URL(next, url.origin))
+}
+```
 
 ## RLS Policy Patterns
 
@@ -72,6 +144,35 @@ using (
 ```
 
 For performance, index columns used in RLS predicates. Wrap stable JWT helper calls as `(select auth.uid())` or `(select auth.jwt())` when the result does not depend on the row.
+
+## Profiles And `auth.users`
+
+Do not expose `auth.users` to `anon` or `authenticated`, and do not create API-facing views that join it into browser-readable results. Keep public or app-visible user fields in an app table:
+
+```sql
+create table public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  display_name text,
+  avatar_url text
+);
+
+alter table public.profiles enable row level security;
+
+create policy "profiles_read_authenticated"
+on public.profiles
+for select
+to authenticated
+using (true);
+
+create policy "profiles_update_own"
+on public.profiles
+for update
+to authenticated
+using ((select auth.uid()) = id)
+with check ((select auth.uid()) = id);
+```
+
+Only copy fields that are intended for the app. Never mirror provider tokens, email verification internals, identities JSON, MFA factors, or private metadata.
 
 ## Service Role Rules
 
@@ -130,12 +231,62 @@ with check (
 );
 ```
 
+## Realtime
+
+Realtime has multiple surfaces with different authorization behavior.
+
+- For `postgres_changes`, make sure the underlying table has RLS enabled and policies tested with the subscribing role.
+- Do not assume channel `broadcast` and `presence` events inherit table RLS. Authorize channel access with Realtime authorization policies or route broadcasts through server-side checks.
+- Do not put sensitive data in presence payloads: email, IP address, exact location, provider IDs, access tokens, session IDs, or private metadata.
+- Treat Realtime admin/service roles as privileged and keep them server-only.
+
+Audit:
+
+```bash
+rg -n "postgres_changes|broadcast|presence|realtime\\.messages|channel\\(" app src supabase
+```
+
+Verification:
+
+- Subscribe as user A to user B's project/channel and confirm no events arrive.
+- Try broadcast/presence on a forbidden channel and confirm rejection.
+- Inspect payloads for private profile fields.
+
+## Database Webhooks
+
+Supabase Database Webhooks can call a Next.js Route Handler when rows change. Treat the receiver as an internet-facing webhook:
+
+- Verify the Supabase signature header or shared secret before trusting the body.
+- Read the raw body for signature verification when the verification scheme requires it.
+- Reject unexpected methods and content types.
+- Make webhook handlers idempotent.
+- Do not run service-role mutations from webhook input until the signature is verified.
+
+Sketch:
+
+```ts
+export async function POST(request: Request) {
+  const signature = request.headers.get('x-supabase-signature')
+  const body = await request.text()
+
+  if (!verifySupabaseWebhook(body, signature, process.env.SUPABASE_WEBHOOK_SECRET)) {
+    return new Response('Unauthorized', { status: 401 })
+  }
+
+  const event = JSON.parse(body)
+  // process verified event
+}
+```
+
 ## Verification
 
 - Run Supabase advisors or lint when available.
 - Test three identities: unauthenticated, wrong authenticated user, correct authenticated user.
 - For migrations, verify both grants and RLS policies.
 - For storage, test forbidden object paths and replacement uploads.
+- For auth helpers, test that server code rejects a forged/stale local session and uses `getUser()`.
+- For OAuth callbacks, test `?next=https://evil.example`, `?next=//evil.example`, and a valid relative path.
+- For Realtime, test wrong-user subscription/broadcast/presence attempts.
 
 ## Sources To Recheck
 
@@ -144,3 +295,8 @@ with check (
 - https://supabase.com/docs/guides/api/securing-your-api
 - https://supabase.com/docs/guides/security/product-security
 - https://supabase.com/docs/guides/security/npm-security
+- https://supabase.com/docs/reference/javascript/auth-getuser
+- https://supabase.com/docs/guides/auth/server-side/nextjs
+- https://supabase.com/docs/guides/auth/redirect-urls
+- https://supabase.com/docs/guides/realtime/authorization
+- https://supabase.com/docs/guides/database/webhooks

@@ -101,7 +101,9 @@ $vibecoding-security-skill 로 전체 보안 리뷰를 하고 security_review.md
 - `references/nextjs-security.md`: Next.js 보안 경계와 Server Actions/DAL 패턴
 - `references/supabase-security.md`: Supabase RLS, service role, Storage, Data API 보안
 - `references/vercel-security.md`: Vercel env, deployment protection, headers, source maps
+- `references/audit-checklist.md`: 실제 리뷰 때 쓰는 체크박스형 감사 목록
 - `references/reporting.md`: 보안 finding과 fix report 템플릿
+- `scripts/audit.sh`: 프로젝트 루트에서 빠르게 위험 패턴을 찾는 ripgrep 기반 감사 스크립트
 
 ## 주요 참고 출처
 

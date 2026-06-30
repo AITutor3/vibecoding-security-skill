@@ -28,6 +28,8 @@ High-risk signs:
 - Use of `searchParams.isAdmin`, role flags in local storage, or values from `user_metadata` for authorization.
 - Cache directives around user-specific data without per-user keys or private/no-store behavior.
 - Redirects using unvalidated `next`, `returnTo`, or URL params.
+- Middleware or Proxy that redirects unauthenticated users but is treated as the only protection for Server Actions, Route Handlers, or DAL functions.
+- `unstable_cache`, `use cache`, `revalidate`, or `force-static` around private data without a user/tenant-specific key.
 
 ## Fix Patterns
 
@@ -90,20 +92,98 @@ Route Handler rules:
 - For webhooks, verify signature before parsing as trusted business data.
 - For CORS, allow explicit origins only when browser cross-origin access is actually required.
 
+Middleware/Proxy rules:
+
+- Treat Middleware/Proxy as a soft gate for UX redirects, coarse route gating, and Supabase session refresh.
+- Do not treat Middleware/Proxy as authorization. Edge checks can miss Server Actions, Route Handlers, alternate routes, direct fetches, or future route additions.
+- Repeat authentication and resource authorization in the DAL, Server Action, and Route Handler.
+- If Middleware uses `matcher`, compare it against every protected route and API route. Add tests for protected routes without cookies.
+
+Safe pattern:
+
+```ts
+// middleware.ts can redirect early, but it does not replace server-side authz.
+export async function middleware(request: NextRequest) {
+  const user = await readUserForRedirectOnly(request)
+  if (!user && request.nextUrl.pathname.startsWith('/dashboard')) {
+    return NextResponse.redirect(new URL('/login', request.url))
+  }
+  return NextResponse.next()
+}
+
+// app/projects/actions.ts still re-checks identity and ownership.
+'use server'
+
+export async function updateProjectAction(formData: FormData) {
+  const user = await requireVerifiedUser()
+  await assertProjectMember(user.id, formData.get('projectId'))
+  // mutate after authz
+}
+```
+
 Caching rules:
 
 - Avoid caching personalized data unless the cache key is tied to the authenticated user and cannot be shared.
 - Do not put secret-dependent or user-dependent data in static generation paths.
 - After mutations, revalidate only paths/tags the current user is authorized to affect.
+- For `unstable_cache` or `use cache`, include the user ID, organization ID, tenant ID, or other authorization boundary in the cache key/tags when the result is private.
+
+Unsafe:
+
+```ts
+const getDashboard = unstable_cache(async () => {
+  return loadDashboardForCurrentUser()
+})
+```
+
+Safer:
+
+```ts
+const getDashboard = (userId: string) =>
+  unstable_cache(
+    async () => loadDashboardForUser(userId),
+    ['dashboard', userId],
+    { tags: [`user-${userId}`] },
+  )()
+```
+
+Rate limiting rules:
+
+- Add rate limits to login, signup, OTP/magic-link send, password reset, invite, upload, webhook, expensive report generation, and AI/LLM routes.
+- In Vercel/serverless environments, prefer an external durable store such as Upstash Redis with `@upstash/ratelimit`, or use Vercel Firewall for coarse IP-based limits.
+- Do not use in-memory Express middleware patterns as the only limit in serverless Route Handlers; instances are ephemeral and do not share state.
+
+Example:
+
+```ts
+import { Ratelimit } from '@upstash/ratelimit'
+import { Redis } from '@upstash/redis'
+
+const ratelimit = new Ratelimit({
+  redis: Redis.fromEnv(),
+  limiter: Ratelimit.slidingWindow(5, '1 m'),
+})
+
+export async function POST(request: Request) {
+  const ip = request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ?? 'unknown'
+  const { success } = await ratelimit.limit(`login:${ip}`)
+  if (!success) return new Response('Too many requests', { status: 429 })
+  // continue with validated auth flow
+}
+```
 
 ## Verification
 
 - Build should fail if `server-only` modules are imported by client components.
 - Test wrong-user and unauthenticated calls for every protected action/route.
 - Confirm return values are DTOs, not full database rows or auth/session objects.
+- Directly call protected Server Actions/Route Handlers where possible instead of only testing page navigation guarded by Middleware.
+- Test private cached data with two different users or tenants.
 
 ## Sources To Recheck
 
 - https://nextjs.org/docs/app/guides/data-security
 - https://nextjs.org/docs/app/guides/content-security-policy
 - https://nextjs.org/docs/app/guides/environment-variables
+- https://nextjs.org/docs/app/api-reference/functions/unstable_cache
+- https://upstash.com/docs/redis/sdks/ratelimit-ts/overview
